@@ -1,0 +1,235 @@
+# docker-compose.yaml for Bank of Anthos
+#
+# Purpose: run the full application locally for development and learning.
+# This file is OURS - it does not exist upstream (BoA uses skaffold/k8s only).
+#
+# Design notes:
+#   * Python services (frontend, contacts, userservice, loadgenerator) are built
+#     locally from their upstream Dockerfiles.
+#   * Java services (ledgerwriter, balancereader, transactionhistory) build via
+#     Jib upstream and have NO Dockerfile, so for the first run we pull the
+#     upstream prebuilt images. Rewriting Java Dockerfiles is a Phase A work
+#     item (see docker/README.md).
+#   * accounts-db and ledger-db are standard Postgres 16 images with init
+#     scripts baked in - build locally.
+#   * JWT keypair is generated before services start (see jwt/README.md).
+#
+# Compose is NOT the deployment target - EKS + Helm is. This exists to teach
+# us each service's ports, deps, and env before we wrap them in the platform.
+
+name: bank-of-anthos
+
+services:
+  # ---------------------------------------------------------------------------
+  # Databases (isolated from each other, only reachable by their own services)
+  # ---------------------------------------------------------------------------
+  accounts-db:
+    build:
+      context: src/accounts/accounts-db
+    environment:
+      POSTGRES_DB: accounts-db
+      POSTGRES_USER: accounts-admin
+      POSTGRES_PASSWORD: accounts-pwd
+    volumes:
+      - accounts-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U accounts-admin -d accounts-db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - accounts-net
+
+  ledger-db:
+    build:
+      context: src/ledger/ledger-db
+    environment:
+      POSTGRES_DB: postgresdb
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password
+    volumes:
+      - ledger-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d postgresdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - ledger-net
+
+  # ---------------------------------------------------------------------------
+  # Application services
+  # ---------------------------------------------------------------------------
+  frontend:
+    build:
+      context: src/frontend
+    environment:
+      VERSION: v0.6.10
+      PORT: "8080"
+      SCHEME: http
+      LOG_LEVEL: info
+      ENABLE_TRACING: "false"
+      DEFAULT_USERNAME: testuser
+      DEFAULT_PASSWORD: bankofanthos
+      # service-api-config equivalent
+      TRANSACTIONS_API_ADDR: ledgerwriter:8080
+      BALANCES_API_ADDR: balancereader:8080
+      HISTORY_API_ADDR: transactionhistory:8080
+      CONTACTS_API_ADDR: contacts:8080
+      USERSERVICE_API_ADDR: userservice:8080
+      # environment-config equivalent
+      LOCAL_ROUTING_NUM: "883745000"
+      PUB_KEY_PATH: /tmp/.ssh/publickey
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./jwt/publickey:/tmp/.ssh/publickey:ro
+    depends_on:
+      - accounts-db
+      - ledger-db
+    networks:
+      - frontend-net
+      - accounts-net
+      - ledger-net
+
+  contacts:
+    build:
+      context: src/accounts/contacts
+    environment:
+      VERSION: v0.6.10
+      PORT: "8080"
+      LOG_LEVEL: info
+      ENABLE_TRACING: "false"
+      # environment-config equivalent
+      LOCAL_ROUTING_NUM: "883745000"
+      PUB_KEY_PATH: /tmp/.ssh/publickey
+      # accounts-db-config equivalent
+      ACCOUNTS_DB_URI: postgresql://accounts-admin:accounts-pwd@accounts-db:5432/accounts-db
+    volumes:
+      - ./jwt/publickey:/tmp/.ssh/publickey:ro
+    depends_on:
+      accounts-db:
+        condition: service_healthy
+    networks:
+      - accounts-net
+
+  userservice:
+    build:
+      context: src/accounts/userservice
+    environment:
+      VERSION: v0.6.10
+      PORT: "8080"
+      LOG_LEVEL: info
+      ENABLE_TRACING: "false"
+      TOKEN_EXPIRY_SECONDS: "3600"
+      # environment-config equivalent
+      LOCAL_ROUTING_NUM: "883745000"
+      PUB_KEY_PATH: /tmp/.ssh/publickey
+      PRIV_KEY_PATH: /tmp/.ssh/privatekey
+      # accounts-db-config equivalent
+      ACCOUNTS_DB_URI: postgresql://accounts-admin:accounts-pwd@accounts-db:5432/accounts-db
+    volumes:
+      - ./jwt/publickey:/tmp/.ssh/publickey:ro
+      - ./jwt/privatekey:/tmp/.ssh/privatekey:ro
+    depends_on:
+      accounts-db:
+        condition: service_healthy
+    networks:
+      - accounts-net
+
+  ledgerwriter:
+    image: us-central1-docker.pkg.dev/bank-of-anthos-ci/bank-of-anthos/ledgerwriter:v0.6.10
+    environment:
+      VERSION: v0.6.10
+      PORT: "8080"
+      LOG_LEVEL: info
+      ENABLE_TRACING: "false"
+      ENABLE_METRICS: "false"
+      HOSTNAME: ledgerwriter-local
+      # environment-config equivalent
+      LOCAL_ROUTING_NUM: "883745000"
+      PUB_KEY_PATH: /tmp/.ssh/publickey
+      # service-api-config equivalent - ledgerwriter calls balancereader
+      BALANCES_API_ADDR: balancereader:8080
+      # ledger-db-config equivalent (Spring Boot)
+      SPRING_DATASOURCE_URL: jdbc:postgresql://ledger-db:5432/postgresdb
+      SPRING_DATASOURCE_USERNAME: admin
+      SPRING_DATASOURCE_PASSWORD: password
+    volumes:
+      - ./jwt/publickey:/tmp/.ssh/publickey:ro
+    depends_on:
+      ledger-db:
+        condition: service_healthy
+    networks:
+      - ledger-net
+
+  balancereader:
+    image: us-central1-docker.pkg.dev/bank-of-anthos-ci/bank-of-anthos/balancereader:v0.6.10
+    environment:
+      VERSION: v0.6.10
+      PORT: "8080"
+      LOG_LEVEL: info
+      ENABLE_TRACING: "false"
+      ENABLE_METRICS: "false"
+      HOSTNAME: balancereader-local
+      # environment-config equivalent
+      LOCAL_ROUTING_NUM: "883745000"
+      PUB_KEY_PATH: /tmp/.ssh/publickey
+      # ledger-db-config equivalent (Spring Boot)
+      SPRING_DATASOURCE_URL: jdbc:postgresql://ledger-db:5432/postgresdb
+      SPRING_DATASOURCE_USERNAME: admin
+      SPRING_DATASOURCE_PASSWORD: password
+    volumes:
+      - ./jwt/publickey:/tmp/.ssh/publickey:ro
+    depends_on:
+      ledger-db:
+        condition: service_healthy
+    networks:
+      - ledger-net
+
+  transactionhistory:
+    image: us-central1-docker.pkg.dev/bank-of-anthos-ci/bank-of-anthos/transactionhistory:v0.6.10
+    environment:
+      VERSION: v0.6.10
+      PORT: "8080"
+      LOG_LEVEL: info
+      ENABLE_TRACING: "false"
+      ENABLE_METRICS: "false"
+      HOSTNAME: transactionhistory-local
+      # environment-config equivalent
+      LOCAL_ROUTING_NUM: "883745000"
+      PUB_KEY_PATH: /tmp/.ssh/publickey
+      # ledger-db-config equivalent (Spring Boot)
+      SPRING_DATASOURCE_URL: jdbc:postgresql://ledger-db:5432/postgresdb
+      SPRING_DATASOURCE_USERNAME: admin
+      SPRING_DATASOURCE_PASSWORD: password
+    volumes:
+      - ./jwt/publickey:/tmp/.ssh/publickey:ro
+    depends_on:
+      ledger-db:
+        condition: service_healthy
+    networks:
+      - ledger-net
+
+  loadgenerator:
+    build:
+      context: src/loadgenerator
+    environment:
+      FRONTEND_ADDR: frontend:80
+      USERS: "5"
+      LOG_LEVEL: error
+    depends_on:
+      - frontend
+    networks:
+      - frontend-net
+
+networks:
+  accounts-net:
+  ledger-net:
+  frontend-net:
+
+volumes:
+  accounts-db-data:
+  ledger-db-data:

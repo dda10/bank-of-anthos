@@ -5,3 +5,6 @@
 
 # Local overrides
 docker/.env
+
+# JWT keypair - never commit keys
+jwt/
